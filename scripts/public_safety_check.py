@@ -43,7 +43,11 @@ import sensitive_judge  # noqa: E402
 POLICY_DIR = ".public-safety"
 PRIVATE_REPOS_FILE = os.path.expanduser("~/.config/public-safety/private-repos.txt")
 DATA_EXTENSIONS = (".json", ".jsonl", ".csv", ".tsv", ".parquet", ".pkl", ".db", ".sqlite", ".xml", ".yaml", ".yml")
-ALLOWED_EMAIL_RE = re.compile(r"(@example\.(com|org|net)$|^noreply@anthropic\.com$|@users\.noreply\.github\.com$)", re.I)
+ALLOWED_EMAIL_RE = re.compile(
+    r"(@example\.(com|org|net)$|^noreply@anthropic\.com$|@users\.noreply\.github\.com$"
+    r"|@\d+x\.(png|jpe?g|gif|svg|webp|avif)$"                                    # retina image names (icon@2x.png)
+    r"|^(you|your|user|username|name|email|me|someone)@(your)?(email|domain|company|example)\.[a-z]+$)", re.I)
+PLACEHOLDER_USERS = {"yourname", "username", "user", "you", "me", "name", "<user>", "$user", "${user}", "your-user"}
 
 _EMAIL_RE = re.compile(r"(?<![\w.+\\-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![\w-])")
 _CPF_RE = re.compile(r"(?<![\d.-])(\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})(?![\d-])")
@@ -59,8 +63,8 @@ _SECRET_RES = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),  # JWT
 ]
-_LOCAL_PATH_RE = re.compile(r"(?<![\w.])(/Users/[A-Za-z0-9][^/\s'\"`]*|/home/[A-Za-z0-9][^/\s'\"`]*|"
-                            r"[A-Za-z]:\\Users\\[A-Za-z0-9][^\\\s'\"`]*)")
+_LOCAL_PATH_RE = re.compile(r"(?<![\w.])(/Users/[A-Za-z0-9<$][^/\s'\"`]*|/home/[A-Za-z0-9<$][^/\s'\"`]*|"
+                            r"[A-Za-z]:\\Users\\[A-Za-z0-9<$][^\\\s'\"`]*)")
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*")
 _PART_RE = re.compile(r"[A-Za-z0-9]+")
 _HEX_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{7,40}(?![0-9a-fA-F])")
@@ -192,7 +196,8 @@ def scan_text(path: str, text: str, policy: Policy, private: Optional[PrivateInd
             for m in rx.finditer(line):
                 add("secret", m.group(0)[:12] + "…")
         for m in _LOCAL_PATH_RE.finditer(line):
-            add("local-path", m.group(1))
+            if m.group(1).rstrip("/.,;:)").split("/")[-1].split("\\")[-1].lower() not in PLACEHOLDER_USERS:
+                add("local-path", m.group(1))
         if policy.denylist:
             words = set()
             for w in _WORD_RE.findall(line):
@@ -219,7 +224,8 @@ def scan_path(path: str, policy: Policy) -> List[Finding]:
 
 
 def _git(root: str, *args: str) -> str:
-    return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, check=True).stdout
+    # published text may be in any encoding (latin-1 files, binary diffs); never crash the gate on it
+    return subprocess.run(["git", "-C", root, *args], capture_output=True, check=True).stdout.decode("utf-8", "replace")
 
 
 def _blob(root: str, spec: str) -> Optional[str]:

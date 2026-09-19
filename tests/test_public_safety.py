@@ -59,6 +59,11 @@ class TestTextRules(unittest.TestCase):
     def test_escaped_newline_before_a_decorator_is_not_an_email(self):
         self.assertEqual(self.kinds("src = 'x = 1\\n@router.post(\"/a\")'"), [])
 
+    def test_image_names_and_placeholder_addresses_are_not_emails(self):
+        for text in ("![hero](live-NN" + AT + "2x.png)", "icon" + AT + "3x.webp", "email: your" + AT + "email.com",
+                     "you" + AT + "yourdomain.com", "user" + AT + "domain.com"):
+            self.assertEqual(self.kinds(text), [], text)
+
     def test_brazilian_phone_numbers_are_pii(self):
         self.assertEqual(self.kinds("tel = '+55 81 " + "99876-5432'"), ["pii:phone"])
         self.assertEqual(self.kinds("tel = '(81) " + "99876-5432'"), ["pii:phone"])
@@ -74,6 +79,9 @@ class TestTextRules(unittest.TestCase):
         self.assertEqual(self.kinds(f"repo = '{HOME}someone/app'"), ["local-path"])
         self.assertEqual(self.kinds("--repo /path/to/repo"), [])
         self.assertEqual(self.kinds("local paths such as `/Users/...` or /home/...)"), [])
+        for placeholder in ("yourname", "username", "you", "me", "<user>", "USER", "$USER"):
+            self.assertEqual(self.kinds(f"cd {USERS}{placeholder}/project"), [], placeholder)
+        self.assertEqual(self.kinds(f"flagged {USERS}yourname."), [])  # trailing punctuation
 
     def test_denylisted_terms_match_whole_words_and_word_parts(self):
         self.assertEqual(self.kinds("see acmecorp-platform"), ["private-term"])
@@ -211,6 +219,22 @@ class TestJevLayer(unittest.TestCase):
             with mock.patch.object(ps.sensitive_judge, "judge", side_effect=judge):
                 ps.check(tmp, mode="range", rev_range=f"{base}..HEAD", policy=ps.Policy(allowlist=[ALLOWED]), jev_key="k")
         self.assertNotIn(ALLOWED, dict(calls)["a.toml"])
+
+    def test_non_utf8_text_does_not_crash_the_scan(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = GitRepo(tmp)
+            repo.commit({"a.txt": "x\n"}, "init")
+            base = repo.head()
+            with open(os.path.join(tmp, "legacy.txt"), "wb") as fh:
+                fh.write("caf\u00e9 com a\u00e7\u00facar\n".encode("latin-1"))
+            repo.git("add", "legacy.txt")
+            repo.git("commit", "-q", "-m", "latin-1 file")
+            judge, calls = self.fake_judge("never")
+            with mock.patch.object(ps.sensitive_judge, "judge", side_effect=judge):
+                found = ps.check(tmp, mode="range", rev_range=f"{base}..HEAD", policy=ps.Policy(), jev_key="k")
+        self.assertEqual(found, [])
+        self.assertIn("legacy.txt", dict(calls))
 
     def test_private_project_threshold_and_api_failures(self):
         from unittest import mock
