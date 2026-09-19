@@ -1,0 +1,2 @@
+# Data files under evals/ that may be published (synthetic or aggregate only).
+evals/dataset.example.json

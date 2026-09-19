@@ -1,0 +1,3 @@
+#!/bin/sh
+# Blocks PII, secrets and private material from being committed (see scripts/public_safety_check.py).
+exec python3 "$(git rev-parse --show-toplevel)/scripts/public_safety_check.py" --staged

@@ -1,0 +1,5 @@
+# Exact strings that are public on purpose; removed before scanning.
+it@intrador.com.br
+# public library APIs that a private repository happens to override
+validate_result
+end_headers

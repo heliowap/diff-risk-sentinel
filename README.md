@@ -306,6 +306,18 @@ See [evals/case_study_epic_pr.md](evals/case_study_epic_pr.md). A reproduction w
 
 ---
 
+## 🔒 Contributing and publishing safety
+
+The evaluations in this repository were run on private codebases; only aggregates are published. To keep it that way, `scripts/public_safety_check.py` blocks personal data (CPF/CNPJ, e-mails, phone numbers), secrets, local paths, hashed private terms and unlisted data files under `evals/`, and, locally, commit SHAs and distinctive identifiers of the private repositories listed in `~/.config/public-safety/private-repos.txt`. Enable the hooks once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The same scan runs in CI on every push and pull request. Rules for contributors and coding agents are in [CLAUDE.md](CLAUDE.md).
+
+---
+
 ## 📄 License
 
 MIT © Helio

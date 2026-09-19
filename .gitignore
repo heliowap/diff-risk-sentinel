@@ -53,3 +53,8 @@ targets.json
 
 # Eval outputs
 eval_results.json
+dead_code.json
+
+# Private evaluation data (never published; see CLAUDE.md)
+evals/private/
+*.private.*

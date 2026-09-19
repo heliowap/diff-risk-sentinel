@@ -40,7 +40,7 @@ if len(buttons) not in {2, 3}:
     unsupported.append("button_count")
 else:
     rows = [normalize(b) for b in buttons if isinstance(b, dict)]   # may drop malformed items
-    errors = button_mix_errors(rows)                                  # assumes ≥ 2 rows
+    errors = check_button_mix(rows)                                  # assumes ≥ 2 rows
 ```
 
 Two items with one malformed passed the count check and reached a validator that assumes at least two valid rows.

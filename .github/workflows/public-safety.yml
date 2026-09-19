@@ -1,0 +1,27 @@
+name: Public safety
+
+# Fails when a push or PR would publish PII, secrets or private evaluation data.
+# Local hooks (.githooks, enabled with `git config core.hooksPath .githooks`) stop it earlier;
+# this is the backstop for commits made without them.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Tracked files
+        run: python3 scripts/public_safety_check.py --all
+      - name: Commit messages and authors of the PR
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/public_safety_check.py --range "origin/${{ github.base_ref }}..HEAD"
