@@ -21,4 +21,5 @@ This repository is **public**. Its evaluations were run on the maintainer's priv
 - Private terms go into the hashed denylist: `python3 scripts/public_safety_check.py --add-term <term>` (the term itself is never written to the repository).
 - Local private repositories listed in `~/.config/public-safety/private-repos.txt` are checked for leaked commit SHAs and distinctive identifiers.
 - A genuinely public string that trips a check (a library API name) goes into `.public-safety/allowlist.txt`, never a private one.
-- CI (`.github/workflows/public-safety.yml`) runs the same scan on every push and PR.
+- With `TYPESAFE_API_KEY` set, the pre-push hook adds a Jev judgment (personal data; material of the private projects described in `~/.config/public-safety/private-context.txt`, which stays local). Run `python3 scripts/public_safety_check.py --all --jev` for a full audit.
+- CI (`.github/workflows/public-safety.yml`) runs the regex scan on every push and PR.

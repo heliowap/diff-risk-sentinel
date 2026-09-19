@@ -1,5 +1,7 @@
 import hashlib
 import importlib.util
+import io
+from contextlib import redirect_stderr
 import os
 import tempfile
 import unittest
@@ -127,6 +129,12 @@ class TestPrivateRepositories(unittest.TestCase):
         text = "parse_arguments and a description of InvoiceReconciliationService"
         self.assertEqual([f.detail for f in ps.scan_text("a.md", text, ps.Policy(), index)], ["InvoiceReconciliationService"])
 
+    def test_two_part_names_and_dunders_are_too_generic(self):
+        GitRepo(self.private).commit({"q.ts": "const queryClient = new QueryClient();\n",
+                                      "m.py": "class Rec:\n    def __post_init__(self):\n        pass\n"}, "generic")
+        index = ps.PrivateIndex([self.private], own_repo=self.public)
+        self.assertEqual(ps.scan_text("a.ts", "queryClient.invalidate(); obj.__post_init__()", ps.Policy(), index), [])
+
     def test_identifiers_also_defined_in_this_repo_are_not_flagged(self):
         GitRepo(self.private).commit({"svc/util.py": "def extract_functions():\n    return 0\n"}, "more")
         index = ps.PrivateIndex([self.private], own_repo=self.public)
@@ -163,6 +171,65 @@ class TestGitModes(unittest.TestCase):
             found = ps.check(tmp, mode="range", rev_range="..HEAD", policy=ps.Policy())
         self.assertEqual(sorted((f.kind, f.path) for f in found),
                          [("pii:email", "a.py"), ("pii:email", "commit message")])
+
+
+
+class TestJevLayer(unittest.TestCase):
+
+    def fake_judge(self, flag_word):
+        calls = []
+
+        def judge(api_key, path, text):
+            calls.append((path, text))
+            hit = flag_word in text
+            return {"p_personal_data": 0.95 if hit else 0.01, "p_private_project": 0.1, "p_sensitive": 0.95 if hit else 0.1}
+        return judge, calls
+
+    def test_added_hunks_and_messages_are_judged_and_flagged(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = GitRepo(tmp)
+            repo.commit({"notes.md": "intro\n\nold text stays\n"}, "init")
+            base = repo.head()
+            repo.commit({"notes.md": "intro\n\nold text stays\nplaceholder person FLAGME (fictitious)\n"}, "add note")
+            judge, calls = self.fake_judge("FLAGME")
+            with mock.patch.object(ps.sensitive_judge, "judge", side_effect=judge):
+                found = ps.check(tmp, mode="range", rev_range=f"{base}..HEAD", policy=ps.Policy(), jev_key="k")
+        self.assertEqual([(f.kind, f.path) for f in found], [("jev:personal-data", "notes.md")])
+        judged = dict(calls)
+        self.assertEqual(judged["notes.md"], "placeholder person FLAGME (fictitious)")  # only the added lines
+        self.assertIn("commit message", judged)
+
+    def test_allowlisted_strings_are_removed_before_judging(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = GitRepo(tmp)
+            repo.commit({"a.toml": "x = 1\n"}, "init")
+            base = repo.head()
+            repo.commit({"a.toml": f"x = 1\nauthors = ['Maintainer <{ALLOWED}>']\n"}, "author")
+            judge, calls = self.fake_judge("never")
+            with mock.patch.object(ps.sensitive_judge, "judge", side_effect=judge):
+                ps.check(tmp, mode="range", rev_range=f"{base}..HEAD", policy=ps.Policy(allowlist=[ALLOWED]), jev_key="k")
+        self.assertNotIn(ALLOWED, dict(calls)["a.toml"])
+
+    def test_private_project_threshold_and_api_failures(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = GitRepo(tmp)
+            repo.commit({"a.md": "x\n"}, "init")
+            base = repo.head()
+            repo.commit({"a.md": "x\nour clinic's reminder rules\n", "b.md": "unrelated text\n"}, "more")
+
+            def judge(api_key, path, text):
+                if path == "b.md":
+                    return {"error": "HTTP 503"}
+                p = 0.85 if path == "a.md" else 0.1
+                return {"p_personal_data": 0.0, "p_private_project": p, "p_sensitive": p}
+            out = io.StringIO()
+            with mock.patch.object(ps.sensitive_judge, "judge", side_effect=judge), redirect_stderr(out):
+                found = ps.check(tmp, mode="range", rev_range=f"{base}..HEAD", policy=ps.Policy(), jev_key="k")
+        self.assertEqual([(f.kind, f.path) for f in found], [("jev:private-project", "a.md")])
+        self.assertIn("could not be judged", out.getvalue())
 
 
 if __name__ == "__main__":

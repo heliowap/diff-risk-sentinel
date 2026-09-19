@@ -12,8 +12,8 @@ Checks every text that would be published — file contents and commit messages 
   * eval data files: data under evals/ must be listed in .public-safety/allowed-data.txt, and
     evals/private/ is never published;
   * private repositories (local only): commit SHAs and distinctive identifiers (compound
-    snake_case/camelCase function and class names of 10+ characters, defined in exactly one
-    private repository and not in this one) of the repositories listed in
+    function and class names with 3+ parts or 16+ characters, defined in exactly one private
+    repository and not in this one) of the repositories listed in
     ~/.config/public-safety/private-repos.txt or $PUBLIC_SAFETY_PRIVATE_REPOS (os.pathsep-separated).
 
 Strings in .public-safety/allowlist.txt (one per line) are removed before scanning.
@@ -24,6 +24,7 @@ Usage:
     python3 scripts/public_safety_check.py --range A..B        # pre-push (..B: new branch)
     python3 scripts/public_safety_check.py --all               # CI / full audit
     python3 scripts/public_safety_check.py --add-term WORD     # add a private term (stored hashed)
+    add --jev to also ask TypeSafe Jev (scripts/sensitive_judge.py) about the text being published
 """
 
 import argparse
@@ -35,6 +36,9 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Set
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sensitive_judge  # noqa: E402
 
 POLICY_DIR = ".public-safety"
 PRIVATE_REPOS_FILE = os.path.expanduser("~/.config/public-safety/private-repos.txt")
@@ -127,8 +131,7 @@ class PrivateIndex:
             seen.update(_definitions(r))
         # distinctive: compound (snake_case or camelCase), defined in exactly one private repository
         # (names several repositories define — parse_arguments — are generic), not defined here
-        self.identifiers: Set[str] = {i for i, n in seen.items()
-                                      if n == 1 and i not in own and _COMPOUND_RE.search(i)}
+        self.identifiers: Set[str] = {i for i, n in seen.items() if n == 1 and i not in own and _distinctive(i)}
 
     @classmethod
     def from_config(cls, own_repo: str) -> Optional["PrivateIndex"]:
@@ -146,6 +149,15 @@ class PrivateIndex:
         return False
 
 
+def _distinctive(name: str) -> bool:
+    """Compound names of 3+ parts (InvoiceReconciliationService, invoice_total_errors) or 16+ characters;
+    two-part names (queryClient, create_index) and dunders are shared by too many codebases."""
+    if name.startswith("__") or not _COMPOUND_RE.search(name):
+        return False
+    parts = [p for p in re.split(r"_+|(?<=[a-z0-9])(?=[A-Z])", name) if p]
+    return len(parts) >= 3 or len(name) >= 16
+
+
 def _definitions(repo: str) -> Set[str]:
     res = subprocess.run(["git", "-C", repo, "grep", "-h", "-I", "-o", "-E",
                           r"(def|class|function|interface|type|const|let)[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]{9,}",
@@ -153,9 +165,14 @@ def _definitions(repo: str) -> Set[str]:
     return {m.group(1) for m in _DEFINITION_RE.finditer(res.stdout)}
 
 
-def scan_text(path: str, text: str, policy: Policy, private: Optional[PrivateIndex] = None) -> List[Finding]:
+def _without_allowed(text: str, policy: Policy) -> str:
     for allowed in policy.allowlist:
         text = text.replace(allowed, " " * len(allowed))
+    return text
+
+
+def scan_text(path: str, text: str, policy: Policy, private: Optional[PrivateIndex] = None) -> List[Finding]:
+    text = _without_allowed(text, policy)
     found: List[Finding] = []
     for n, line in enumerate(text.split("\n"), 1):
         def add(kind, detail):
@@ -212,14 +229,59 @@ def _blob(root: str, spec: str) -> Optional[str]:
     return res.stdout.decode("utf-8", "replace")
 
 
+def _added_text(root: str, diff_args: List[str]) -> dict:
+    """path -> the lines a diff adds (what would become public), hunk by hunk."""
+    out, path = {}, None
+    for line in _git(root, "diff", "--no-color", "--no-ext-diff", "-U0", *diff_args).split("\n"):
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+        elif path and line.startswith("+") and not line.startswith("+++"):
+            out.setdefault(path, []).append(line[1:])
+        elif path and line.startswith("@@") and out.get(path):
+            out[path].append("")
+    return {p: "\n".join(lines).strip() for p, lines in out.items() if "".join(lines).strip()}
+
+
+def _chunks(text: str, size: int = 3000) -> List[str]:
+    parts, cur = [], ""
+    for para in re.split(r"\n\s*\n", text):
+        if cur and len(cur) + len(para) > size:
+            parts.append(cur)
+            cur = ""
+        cur = f"{cur}\n\n{para}" if cur else para
+    return parts + ([cur] if cur.strip() else [])
+
+
+def _judge_all(key: str, units: List[tuple], workers: int = 16) -> List[Finding]:
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        answers = list(pool.map(lambda u: sensitive_judge.judge(key, u[0], u[1]), units))
+    found, failed = [], 0
+    for (path, _), a in zip(units, answers):
+        if "error" in a:
+            failed += 1
+        elif a["p_personal_data"] >= sensitive_judge.PERSONAL_DATA_BLOCK:
+            found.append(Finding("jev:personal-data", path, 0, f"p={a['p_personal_data']:.2f}"))
+        elif (a.get("p_private_project") or 0.0) >= sensitive_judge.PRIVATE_PROJECT_BLOCK:
+            found.append(Finding("jev:private-project", path, 0, f"p={a['p_private_project']:.2f}"))
+    if failed:
+        print(f"public-safety: warning — {failed} chunk(s) could not be judged by Jev; regex checks still applied.",
+              file=sys.stderr)
+    return found
+
+
 def check(root: str, mode: str, policy: Optional[Policy] = None, rev_range: Optional[str] = None,
-          message_file: Optional[str] = None, private: Optional[PrivateIndex] = None) -> List[Finding]:
+          message_file: Optional[str] = None, private: Optional[PrivateIndex] = None,
+          jev_key: Optional[str] = None) -> List[Finding]:
     policy = policy if policy is not None else Policy.load(root)
     found: List[Finding] = []
+    units: List[tuple] = []  # (path, text) sent to the Jev judge when jev_key is set
     if mode == "message":
         with open(message_file, encoding="utf-8") as fh:
             text = "\n".join(x for x in fh.read().split("\n") if not x.startswith("#"))
-        return scan_text("commit message", text, policy, private)
+        found = scan_text("commit message", text, policy, private)
+        text = _without_allowed(text, policy)
+        return found + (_judge_all(jev_key, [("commit message", text)]) if jev_key and text.strip() else [])
     if mode == "staged":
         paths = [p for p in _git(root, "diff", "--cached", "--name-only", "--diff-filter=ACMR").split("\n") if p]
         specs = [(p, f":{p}") for p in paths]
@@ -234,7 +296,9 @@ def check(root: str, mode: str, policy: Optional[Policy] = None, rev_range: Opti
             commits = _git(root, "rev-list", rev_range)
         specs = [(p, f"{tip}:{p}") for p in paths]
         for sha in [s for s in commits.split("\n") if s]:
-            found += scan_text("commit message", _git(root, "log", "-1", "--format=%B", sha), policy, private)
+            message = _git(root, "log", "-1", "--format=%B", sha)
+            found += scan_text("commit message", message, policy, private)
+            units.append(("commit message", message))
     else:
         specs = [(p, f"HEAD:{p}") for p in _git(root, "ls-files").split("\n") if p]
     for path, spec in specs:
@@ -244,6 +308,17 @@ def check(root: str, mode: str, policy: Optional[Policy] = None, rev_range: Opti
         text = _blob(root, spec)
         if text is not None:
             found += scan_text(path, text, policy, private)
+            if jev_key and mode == "all":
+                units += [(path, c) for c in _chunks(text)]
+    if jev_key:
+        if mode in ("staged", "range"):
+            diff_args = ["--cached"] if mode == "staged" else (
+                [rev_range] if not rev_range.startswith("..") else ["4b825dc642cb6eb9a060e54bf8d69288fbee4904", tip])
+            for path, text in _added_text(root, diff_args).items():
+                if not path.startswith(POLICY_DIR + "/"):
+                    units += [(path, c) for c in _chunks(text)]
+        units = [(path, _without_allowed(text, policy)) for path, text in units]
+        found += _judge_all(jev_key, [u for u in units if u[1].strip()])
     return found
 
 
@@ -256,6 +331,9 @@ def main() -> int:
     g.add_argument("--message")
     g.add_argument("--add-term", help="Add a private term to the hashed denylist")
     ap.add_argument("--repo", default=".")
+    ap.add_argument("--jev", action="store_true",
+                    help="Also ask TypeSafe Jev about personal data and private-project material (needs "
+                         "TYPESAFE_API_KEY; sends the added text to api.typesafe.ai)")
     args = ap.parse_args()
     root = _git(args.repo, "rev-parse", "--show-toplevel").strip()
 
@@ -269,7 +347,10 @@ def main() -> int:
 
     private = PrivateIndex.from_config(root)
     mode = "staged" if args.staged else "message" if args.message else "range" if args.range else "all"
-    found = check(root, mode, rev_range=args.range, message_file=args.message, private=private)
+    jev_key = os.environ.get("TYPESAFE_API_KEY") if args.jev else None
+    if args.jev and not jev_key:
+        print("public-safety: --jev without TYPESAFE_API_KEY; running the regex checks only.", file=sys.stderr)
+    found = check(root, mode, rev_range=args.range, message_file=args.message, private=private, jev_key=jev_key)
     if not found:
         return 0
     print("public-safety: blocked — this would publish sensitive or proprietary material:", file=sys.stderr)

@@ -314,7 +314,7 @@ The evaluations in this repository were run on private codebases; only aggregate
 git config core.hooksPath .githooks
 ```
 
-The same scan runs in CI on every push and pull request. Rules for contributors and coding agents are in [CLAUDE.md](CLAUDE.md).
+With `TYPESAFE_API_KEY` set, the pre-push hook also asks TypeSafe Jev whether the text being published contains personal data or material from the maintainer's private projects (described locally, never committed); on a held-out set, all layers together blocked 74% of sensitive chunks with no false positives, against 41% for the regular expressions alone ([results](evals/sensitive_data_results.md)). The same regex scan runs in CI on every push and pull request. Rules for contributors and coding agents are in [CLAUDE.md](CLAUDE.md).
 
 ---
 
