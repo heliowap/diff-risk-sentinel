@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diff-risk-sentinel"
+version = "0.3.0"
+description = "Diff Risk Sentinel: Combining CRAP Score, OtterWise PR Methodology, and TypeSafe Jev System One for Precision Code Review Triage"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Helio", email = "it@intrador.com.br" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Programming Language :: Python :: 3",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# lizard adds C/C++, C#, Go, Java, Kotlin, Ruby, Rust, Scala, Swift, PHP, Lua, Objective-C
+polyglot = [
+    "lizard>=1.17.10",
+]
+fast = [  # deprecated alias of `polyglot`
+    "lizard>=1.17.10",
+]
+test = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+diff-risk-sentinel = "diff_risk_sentinel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

@@ -1,0 +1,42 @@
+name: Diff Risk Sentinel
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  risk-triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install ".[polyglot]"
+
+      - name: Run Diff Risk Sentinel
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          # Jev sends diff snippets to api.typesafe.ai: only enabled when the secret is configured.
+          JEV_FLAG=""
+          if [ -n "$TYPESAFE_API_KEY" ]; then JEV_FLAG="--jev"; fi
+          diff-risk-sentinel --base "origin/${{ github.base_ref }}" --top 5 --output llm_review_targets.json $JEV_FLAG
+
+      - name: Upload review targets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-review-targets
+          path: llm_review_targets.json
+          if-no-files-found: ignore

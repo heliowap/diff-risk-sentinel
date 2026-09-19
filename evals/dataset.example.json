@@ -1,0 +1,15 @@
+{
+  "repository": "your-repo",
+  "labels": {
+    "CRITICAL_BUG": "positive: commit fixes a real bug; the fixed code should be flagged",
+    "EDGE_CASE_BUG": "positive: commit fixes an edge-case bug; the fixed code should be flagged",
+    "BENEFICIAL_REFACTOR": "commit is a refactor meant to reduce complexity; ΔCRAP should be negative",
+    "SAFE_FAST_PASS": "negative: commit carries no behavioral risk; nothing should be flagged"
+  },
+  "cases": [
+    {"commit": "abc1234", "title": "fix(api): keep explicit None when clearing a schedule", "category": "CRITICAL_BUG",
+     "description": "truthiness check dropped an explicit clear"},
+    {"commit": "def5678", "title": "refactor(api): split the order validator", "category": "BENEFICIAL_REFACTOR",
+     "description": "extracts three helpers from a CCN-40 function"}
+  ]
+}
