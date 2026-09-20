@@ -7,7 +7,18 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from diff_risk_sentinel.deadcode import scan_repository
-from diff_risk_sentinel.deadcode_evidence import RepoIndex, evidence, judge_state, review_with_jev
+from diff_risk_sentinel.deadcode_evidence import (
+    RepoIndex,
+    _extract_class_context,
+    _extract_docstring,
+    evidence,
+    judge_state,
+    judge_stub,
+    judge_tests_only,
+    review_with_jev,
+    stub_state,
+    tests_only_state,
+)
 from tests.gitutil import GitRepo
 
 FILES = {
@@ -109,6 +120,141 @@ class TestDeadCodeCommandWithJev(_Repo):
         self.assertFalse(data["meta"]["jev_enabled"])
         self.assertEqual({f["function"] for f in data["dead_code"]}, {"closeBundle", "lonely"})
         self.assertIn("TYPESAFE_API_KEY", out)
+
+
+class TestStubAndTestsOnlyClassifiers(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.git = GitRepo(self.tmp.name)
+        files = {
+            "app/interfaces.py": (
+                "from typing import Protocol\n\n"
+                "class StorageProvider(Protocol):\n"
+                "    '''Storage abstraction.'''\n"
+                "    def save_blob(self, key: str, data: bytes) -> None:\n"
+                "        '''Save raw bytes.'''\n"
+                "        pass\n"
+            ),
+            "app/orphans.py": (
+                "def forgotten_work():\n"
+                "    # TODO: remove me\n"
+                "    pass\n\n"
+                "def active_seam():\n"
+                "    '''Reset global test harness state.'''\n"
+                "    return True\n\n"
+                "def dead_feature():\n"
+                "    return 42\n"
+            ),
+            "tests/test_orphans.py": (
+                "from app.orphans import active_seam, dead_feature\n\n"
+                "def test_setup():\n"
+                "    assert active_seam() is True\n\n"
+                "def test_dead():\n"
+                "    assert dead_feature() == 42\n"
+            ),
+        }
+        self.git.commit(files, "init")
+        self.index = RepoIndex(self.tmp.name, "HEAD")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_extract_class_context(self):
+        lines = self.index.lines["app/interfaces.py"]
+        fn = self.index.find("app/interfaces.py", "StorageProvider.save_blob")
+        self.assertIsNotNone(fn)
+        ctx = _extract_class_context(lines, fn["start_line"], fn["name"])
+        self.assertIn("class StorageProvider(Protocol):", ctx)
+
+    def test_extract_docstring(self):
+        fn = self.index.find("app/interfaces.py", "StorageProvider.save_blob")
+        lines = self.index.lines["app/interfaces.py"]
+        code = "\n".join(lines[fn["start_line"] - 1:fn["end_line"]])
+        doc = _extract_docstring(code, lines, fn["start_line"], True)
+        self.assertEqual(doc, "Save raw bytes.")
+
+    def test_stub_state_construction(self):
+        fn = self.index.find("app/interfaces.py", "StorageProvider.save_blob")
+        state = stub_state(self.index, "app/interfaces.py", fn)
+        self.assertEqual(state["function"], "StorageProvider.save_blob")
+        self.assertIn("StorageProvider(Protocol)", state["class_context"])
+        self.assertEqual(state["docstring"], "Save raw bytes.")
+        self.assertTrue(state["is_stub"])
+
+    def test_tests_only_state_construction(self):
+        fn = self.index.find("app/orphans.py", "active_seam")
+        ev = evidence(self.index, "app/orphans.py", fn)
+        tstate = tests_only_state(ev, self.index)
+        self.assertEqual(tstate["function"], "active_seam")
+        self.assertGreaterEqual(tstate["test_references_count"], 1)
+        self.assertTrue(any("test_orphans.py" in m for m in tstate["test_mentions"]))
+
+    def test_judge_stub_parses_response(self):
+        fake_ans = {
+            "answers": {
+                "is_intentional_stub": {"noul": 0.92},
+                "stub_pattern": {"choice": "protocol_or_abstract"},
+            },
+            "usage": {"input_tokens": 120},
+        }
+        with mock.patch("diff_risk_sentinel.jev.ask_jev", return_value=fake_ans):
+            res = judge_stub("key", {"function": "test"})
+            self.assertEqual(res["is_intentional_stub"], 0.92)
+            self.assertEqual(res["stub_pattern"], "protocol_or_abstract")
+
+    def test_judge_tests_only_parses_response(self):
+        fake_ans = {
+            "answers": {
+                "is_testability_seam": {"noul": 0.88},
+                "test_usage_role": {"choice": "testability_seam"},
+            },
+            "usage": {"input_tokens": 140},
+        }
+        with mock.patch("diff_risk_sentinel.jev.ask_jev", return_value=fake_ans):
+            res = judge_tests_only("key", {"function": "test"})
+            self.assertEqual(res["is_testability_seam"], 0.88)
+            self.assertEqual(res["test_usage_role"], "testability_seam")
+
+    def test_review_with_jev_differentiates_intentional_and_dead_stubs_and_seams(self):
+        found = [
+            {"file": "app/interfaces.py", "function": "StorageProvider.save_blob", "status": "unreferenced", "stub": True, "lines": "5-7"},
+            {"file": "app/orphans.py", "function": "forgotten_work", "status": "unreferenced", "stub": True, "lines": "1-3"},
+            {"file": "app/orphans.py", "function": "active_seam", "status": "tests_only", "stub": False, "lines": "5-7"},
+            {"file": "app/orphans.py", "function": "dead_feature", "status": "tests_only", "stub": False, "lines": "9-10"},
+        ]
+        def stub_judge(key, state):
+            if "StorageProvider" in state["function"]:
+                return {"is_intentional_stub": 0.95, "stub_pattern": "protocol_or_abstract"}
+            return {"is_intentional_stub": 0.05, "stub_pattern": "abandoned_stub"}
+
+        def tests_judge(key, state):
+            if "active_seam" in state["function"]:
+                return {"is_testability_seam": 0.90, "test_usage_role": "testability_seam"}
+            return {"is_testability_seam": 0.10, "test_usage_role": "orphaned_feature"}
+
+        res = review_with_jev(
+            self.tmp.name,
+            "HEAD",
+            found,
+            "k",
+            stub_judge_fn=stub_judge,
+            tests_only_judge_fn=tests_judge,
+        )
+
+        # StorageProvider.save_blob is intentional stub -> vetoed
+        self.assertEqual([f["function"] for f in res["intentional_stubs"]], ["StorageProvider.save_blob"])
+        # active_seam is intentional seam -> vetoed
+        self.assertEqual([f["function"] for f in res["test_seams"]], ["active_seam"])
+        # Both vetoed
+        vetoed_names = {f["function"] for f in res["vetoed_by_jev"]}
+        self.assertIn("StorageProvider.save_blob", vetoed_names)
+        self.assertIn("active_seam", vetoed_names)
+
+        # forgotten_work (dead stub) and dead_feature (orphaned feature) are confirmed in dead_code
+        dead_names = {f["function"] for f in res["dead_code"]}
+        self.assertIn("forgotten_work", dead_names)
+        self.assertIn("dead_feature", dead_names)
 
 
 if __name__ == "__main__":

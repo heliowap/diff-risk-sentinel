@@ -420,7 +420,13 @@ def run_dead_code(repo: Optional[str] = None, rev: str = "HEAD", output: str = "
     if jev:
         meta.update(jev_judged=review["jev_judged"], jev_failures=review["jev_failures"])
         payload.update(vetoed_by_jev=review["vetoed_by_jev"], probable_dead=review["probable_dead"])
-        print(f"   Jev descartou {len(review['vetoed_by_jev'])} achado(s) estático(s) (hooks de framework, callbacks).")
+        if review.get("intentional_stubs"):
+            payload["intentional_stubs"] = review["intentional_stubs"]
+            print(f"   Jev identificou {len(review['intentional_stubs'])} stub(s) intencionais mantidos (interfaces/adapters).")
+        if review.get("test_seams"):
+            payload["test_seams"] = review["test_seams"]
+            print(f"   Jev identificou {len(review['test_seams'])} costura(s) de teste intencionais mantidas (seams/resets).")
+        print(f"   Jev descartou {len(review['vetoed_by_jev'])} achado(s) estático(s) (hooks de framework, callbacks, stubs/seams).")
         if review["jev_failures"]:
             print(f"   ⚠️  {review['jev_failures']} julgamento(s) do Jev falharam; achados estáticos mantidos.")
         if review["probable_dead"]:

@@ -44,14 +44,18 @@ A second mode, **`--dead-code`**, scans a whole repository at one revision for c
        ▼
  3. Triage & OtterWise Prescription
     • Ranking: mean percentile rank of CRAP and the four Jev answers (CRAP alone without --jev)
-    • Consumers outside the diff that still reference a changed contract (identifiers, key formats,
-      removed hard-coded values)
     • Generates `llm_review_targets.json` with targeted prescriptions:
         - CRITICAL_SEMANTIC_AUDIT (Audit state mutations & callers)
         - HIGH_RISK_REFACTOR (Extract seams, early returns, lookup tables)
         - NEEDS_ATTENTION_TESTS (Write parameterized unit tests)
         - SEMANTIC_REVIEW (Structurally fine, behavior change worth a look)
         - BENEFICIAL_REFACTOR (Fast-pass approved!)
+       │
+       ▼
+ 4. Contract & Finding Verification (Evidence-First via TypeSafe Jev)
+    • Consumer Contract Verifier: evaluates untouched callers outside the diff against changed contracts
+    • Stage 6 Finding Verifier: evaluates reviewer claims against cited code (prunes hallucinations,
+      lifting review precision from 28.6% to 66.7% at <$0.0005 USD per run; see evals/review_cost/RESULTS.md)
 ```
 
 ---
@@ -296,7 +300,8 @@ What *did* hold up in practice is the review wrapped around the ranking: in agen
 
 > Earlier versions of this README reported "96% accuracy / 100% bug recall". Those numbers were produced by a version that read files from the working tree instead of the replayed commits and counted any `NEEDS_ATTENTION_TESTS` as a detection, and are superseded by the table above.
 
-### Dead-code evals
+### Dead-code evals & Review Cost
+- [`evals/review_cost/RESULTS.md`](evals/review_cost/RESULTS.md) — empirical results for Stage 6 Finding Verifier, Consumer Contract Checker, and Evidence-First dead-code classifiers (intentional protocol stubs vs abandoned code, testability seams vs orphaned features).
 - [`evals/dead_code_history_eval.py`](evals/dead_code_history_eval.py) — recall against a repository's history: functions deleted by commits that call them dead/unused/orphaned, classified at the parent revision (nothing used them / only code deleted with them did / production still did) and scanned there.
 - [`evals/dead_code_experiment.py`](evals/dead_code_experiment.py) — Jev on function bodies ("does no real work?"): detects stubs (AUC 0.99), not dead code.
 - [`evals/dead_code_results.md`](evals/dead_code_results.md) — all results: blind reviews, dev/test-split tuning of the Jev judge, knip/vulture comparisons, history recall, orphan endpoints, and the team's outcomes on a real report.
