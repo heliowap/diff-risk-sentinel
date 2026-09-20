@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import json
@@ -178,11 +179,12 @@ def _print_summary(agg: Dict[str, Any]):
     print("─" * 80)
 
 
-def _score_with_jev(touched: List[Dict[str, Any]], api_key: str, workers: int) -> int:
+def _score_with_jev(touched: List[Dict[str, Any]], api_key: str, workers: int) -> Dict[str, Any]:
     """
     Asks Jev about every touched production function (not only those above the CRAP
     thresholds) and sets `triage_score`: the mean percentile rank over CRAP and the Jev
-    answers. Returns the number of failed Jev calls.
+    answers. Returns {"failures": n, "usage": {...}} with the summed numeric usage fields
+    reported by the API (missing fields stay absent; nothing is estimated).
     """
     production = [i for i in touched if not is_test_path(i["file"])]
     print(f"🤖 4. Avaliando {len(production)} funções de produção com TypeSafe Jev...")
@@ -193,6 +195,11 @@ def _score_with_jev(touched: List[Dict[str, Any]], api_key: str, workers: int) -
             production))
     by_item = {id(it): a for it, a in zip(production, answers)}
     failures = []
+    usage: Dict[str, float] = {}
+    for answer in answers:
+        for key, value in ((answer or {}).get("usage") or {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                usage[key] = usage.get(key, 0) + value
     for item in touched:
         answer = by_item.get(id(item))
         ok = bool(answer) and "error" not in answer
@@ -210,7 +217,7 @@ def _score_with_jev(touched: List[Dict[str, Any]], api_key: str, workers: int) -
     if failures:
         print(f"⚠️  {len(failures)}/{len(production)} chamadas ao Jev falharam; essas funções ficam no fim da "
               f"ordem do Jev. Exemplo: {failures[0]['jev_error']}")
-    return len(failures)
+    return {"failures": len(failures), "usage": usage}
 
 
 def _classify(items: List[Dict[str, Any]]):
@@ -340,7 +347,11 @@ def run_sentinel(
 
     if jev:
         # Measured ranking: every touched function, ordered by the mean rank of CRAP and Jev.
-        meta["jev_failures"] = _score_with_jev(touched, api_key, workers)
+        stats = _score_with_jev(touched, api_key, workers)
+        meta["jev_failures"] = stats["failures"]
+        meta["jev_usage"] = stats["usage"]
+        meta["jev_tokens"] = int(stats["usage"].get("input_tokens", 0) + stats["usage"].get("output_tokens", 0))
+        meta["jev_cost_usd"] = float(stats["usage"].get("cost_usd", 0.0))
         candidates = sorted(touched, key=lambda x: x["triage_score"], reverse=True)
     else:
         candidates = [

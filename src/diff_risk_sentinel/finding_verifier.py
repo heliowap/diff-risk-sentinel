@@ -66,12 +66,14 @@ def verify_finding_with_jev(
     """
     state = finding_state(finding, cited_code)
     resp = ask_jev(api_key, state, FINDING_VERIFIER_QUESTIONS, timeout=timeout)
+
     if "error" in resp:
         return {
-            "is_valid": False,
-            "support_probability": 0.0,
+            "is_valid": None,
+            "support_probability": None,
             "calibrated_severity": "unknown",
-            "verdict": "ERROR",
+            "verdict": "UNKNOWN",
+            "usage": resp.get("usage", {}),
             "error": resp["error"],
         }
 
@@ -87,4 +89,5 @@ def verify_finding_with_jev(
         "support_probability": prob,
         "calibrated_severity": severity_choice,
         "verdict": verdict,
+        "usage": resp.get("usage", {}),
     }

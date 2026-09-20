@@ -152,6 +152,7 @@ def query_jev_function(
     except ValueError as exc:
         return {"error": f"malformed answer: {exc}"}
     result["confidence"] = round(float((answers.get("semantic_risk") or {}).get("confidence") or 0.0), 2)
+    result["usage"] = data.get("usage", {})
     return result
 
 

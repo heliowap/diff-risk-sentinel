@@ -69,3 +69,40 @@ class TestFindingVerifier(unittest.TestCase):
         self.assertFalse(res["is_valid"])
         self.assertEqual(res["calibrated_severity"], "false_alarm")
         self.assertEqual(res["verdict"], "FALSE_ALARM")
+
+    @patch("diff_risk_sentinel.finding_verifier.ask_jev")
+    def test_verify_error_is_unknown_not_false_alarm(self, mock_ask):
+        mock_ask.return_value = {"error": "HTTP 503", "usage": {"input_tokens": 12}}
+        f = Finding(
+            file="src/calc.py",
+            line=10,
+            function="div",
+            claim="ZeroDivisionError when b == 0",
+            severity="critical",
+        )
+        res = verify_finding_with_jev("fake-key", f, "def div(a, b):\n    return a / b\n")
+        self.assertEqual(res["verdict"], "UNKNOWN")
+        self.assertIsNone(res["is_valid"])
+        self.assertIsNone(res["support_probability"])
+        self.assertEqual(res["error"], "HTTP 503")
+        self.assertEqual(res["usage"], {"input_tokens": 12})
+
+    @patch("diff_risk_sentinel.finding_verifier.ask_jev")
+    def test_verify_records_real_jev_usage(self, mock_ask):
+        mock_ask.return_value = {
+            "answers": {
+                "claim_supported_by_code": {"noul": 0.9},
+                "severity": {"choice": "major"},
+            },
+            "usage": {"input_tokens": 370, "output_tokens": 60, "cost_usd": 0.0008},
+        }
+        f = Finding(
+            file="src/calc.py",
+            line=10,
+            function="div",
+            claim="ZeroDivisionError when b == 0",
+            severity="critical",
+        )
+        res = verify_finding_with_jev("fake-key", f, "def div(a, b):\n    return a / b\n")
+        self.assertEqual(res["usage"],
+                         {"input_tokens": 370, "output_tokens": 60, "cost_usd": 0.0008})

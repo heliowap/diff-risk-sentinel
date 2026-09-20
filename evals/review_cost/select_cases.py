@@ -26,6 +26,9 @@ def stratify_and_select_cases(
     rng = random.Random(seed)
     excluded = set(excluded_intros or set())
 
+    def is_excluded(intro: str) -> bool:
+        return any(intro.startswith(prefix) for prefix in excluded)
+
     # De-duplicate by intro commit
     seen_intros: Set[str] = set()
     small_cases: List[Dict[str, Any]] = []
@@ -34,7 +37,7 @@ def stratify_and_select_cases(
 
     for c in cases:
         intro = c.get("intro", "")
-        if not intro or intro in excluded or intro in seen_intros:
+        if not intro or is_excluded(intro) or intro in seen_intros:
             continue
 
         touched = int(c.get("touched_production_functions", 0))
@@ -61,7 +64,8 @@ def stratify_and_select_cases(
                 touched_production_functions=int(item.get("touched_production_functions", 0)),
                 fix_commit=item.get("fix"),
                 fixed_functions=item.get("fixed_functions", {}),
-                subject=str(item.get("subject", "")),
+                intro_subject=str(item.get("intro_subject", "")),
+                fix_subject=str(item.get("fix_subject", item.get("subject", ""))),
             )
             results.append(cfg)
         return results
@@ -72,7 +76,7 @@ def stratify_and_select_cases(
 
     selected_clean: List[CaseConfig] = []
     if clean_commits and n_clean > 0:
-        clean_pool = [c for c in clean_commits if c.get("intro") not in excluded]
+        clean_pool = [c for c in clean_commits if not is_excluded(str(c.get("intro", "")))]
         sampled_clean = rng.sample(clean_pool, min(n_clean, len(clean_pool))) if len(clean_pool) >= n_clean else list(clean_pool)
         for idx, item in enumerate(sampled_clean, 1):
             intro = item["intro"]
@@ -86,7 +90,8 @@ def stratify_and_select_cases(
                     touched_production_functions=int(item.get("touched_production_functions", 0)),
                     fix_commit=None,
                     fixed_functions=[],
-                    subject=str(item.get("subject", "")),
+                    intro_subject=str(item.get("intro_subject", item.get("subject", ""))),
+                    fix_subject="",
                 )
             )
 

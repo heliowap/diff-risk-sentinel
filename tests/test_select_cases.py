@@ -65,3 +65,22 @@ class TestSelectCases(unittest.TestCase):
         selected_intros = {c.intro_commit for c in selected}
         self.assertNotIn("intro_s_0", selected_intros)
         self.assertNotIn("intro_m_0", selected_intros)
+
+    def test_excluded_intro_prefix_removes_case(self):
+        cases = [{
+            "intro": "abcdef1234567890",
+            "fix": "fedcba0987654321",
+            "intro_subject": "feat: add behavior",
+            "fix_subject": "fix: correct behavior",
+            "fixed_functions": {"src/example.py": ["calculate"]},
+            "touched_production_functions": 3,
+        }]
+        selected = stratify_and_select_cases(
+            cases,
+            n_small=1,
+            n_medium=0,
+            n_large=0,
+            n_clean=0,
+            excluded_intros={"abcdef12"},
+        )
+        self.assertEqual(selected, [])

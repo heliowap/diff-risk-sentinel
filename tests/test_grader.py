@@ -1,5 +1,5 @@
 import unittest
-from evals.review_cost.models import Finding, CaseConfig
+from evals.review_cost.models import Finding, CaseConfig, FindingJudgment
 from evals.review_cost.grader import grade_case_findings, match_function_name
 
 
@@ -105,6 +105,92 @@ class TestGrader(unittest.TestCase):
             fix_diff="diff",
             fix_message="fix reload of replies",
         )
+        self.assertEqual(grading.known_defect_verdict, "near")
+        self.assertEqual(grading.finding_judgments[0].verdict, "unverifiable")
+        self.assertEqual(grading.grading_method, "location_proxy")
+
+    def test_matching_function_without_semantic_judgment_is_near(self):
+        case = CaseConfig(
+            case_id="medium_01",
+            intro_commit="a" * 40,
+            base_commit="a" * 40 + "~1",
+            category="medium",
+            touched_production_functions=40,
+            fix_commit="b" * 40,
+            fixed_functions={"src/order.py": ["Order.checkout"]},
+        )
+        finding = Finding("src/order.py", 30, "Order.checkout", "Unrelated cache concern", "major")
+        grading = grade_case_findings(
+            case, [finding], fix_diff="cache checkout", fix_message="fix checkout"
+        )
+        self.assertEqual(grading.grading_method, "location_proxy")
+        self.assertEqual(grading.known_defect_verdict, "near")
+        self.assertEqual(grading.finding_judgments[0].verdict, "unverifiable")
+
+    def test_semantic_judgments_drive_found_verdict(self):
+        case = CaseConfig(
+            case_id="medium_01",
+            intro_commit="a" * 40,
+            base_commit="a" * 40 + "~1",
+            category="medium",
+            touched_production_functions=40,
+            fix_commit="b" * 40,
+            fixed_functions={"src/order.py": ["Order.checkout"]},
+        )
+        findings = [
+            Finding("src/order.py", 30, "Order.checkout", "Cache invalidation drops pending orders", "critical")
+        ]
+        judgments = [
+            FindingJudgment(
+                finding_index=0,
+                verdict="correct",
+                rationale="Matches the validated defect",
+                matches_known_defect=True,
+                claim_group_id="defect-1",
+            )
+        ]
+        grading = grade_case_findings(
+            case,
+            findings,
+            fix_diff="diff",
+            fix_message="fix checkout",
+            semantic_judgments=judgments,
+        )
+        self.assertEqual(grading.grading_method, "semantic")
         self.assertEqual(grading.known_defect_verdict, "found")
+        self.assertEqual(grading.finding_judgments[0].verdict, "correct")
+        self.assertEqual(grading.finding_judgments[0].claim_group_id, "defect-1")
+
+    def test_semantic_correct_without_match_is_not_found(self):
+        case = CaseConfig(
+            case_id="medium_01",
+            intro_commit="a" * 40,
+            base_commit="a" * 40 + "~1",
+            category="medium",
+            touched_production_functions=40,
+            fix_commit="b" * 40,
+            fixed_functions={"src/order.py": ["Order.checkout"]},
+        )
+        findings = [
+            Finding("src/other.py", 5, "helper", "Real but different bug", "major")
+        ]
+        judgments = [
+            FindingJudgment(
+                finding_index=0,
+                verdict="correct",
+                rationale="Genuine defect, unrelated to the known fix",
+                matches_known_defect=False,
+                claim_group_id="novel-1",
+            )
+        ]
+        grading = grade_case_findings(
+            case,
+            findings,
+            fix_diff="diff",
+            fix_message="fix checkout",
+            semantic_judgments=judgments,
+        )
+        self.assertEqual(grading.grading_method, "semantic")
+        self.assertEqual(grading.known_defect_verdict, "missed")
         self.assertEqual(grading.finding_judgments[0].verdict, "correct")
 

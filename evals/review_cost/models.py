@@ -36,11 +36,13 @@ class Finding:
 class ReviewOutput:
     findings: List[Finding] = field(default_factory=list)
     report_markdown: str = ""
+    treatment_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "findings": [f.to_dict() for f in self.findings],
             "report_markdown": self.report_markdown,
+            "treatment_id": self.treatment_id,
         }
 
     @classmethod
@@ -49,6 +51,7 @@ class ReviewOutput:
         return cls(
             findings=findings,
             report_markdown=data.get("report_markdown", ""),
+            treatment_id=data.get("treatment_id"),
         )
 
 
@@ -61,14 +64,22 @@ class CaseConfig:
     touched_production_functions: int
     fix_commit: Optional[str] = None
     fixed_functions: Any = field(default_factory=dict)
-    subject: str = ""
+    intro_subject: str = ""
+    fix_subject: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> CaseConfig:
-        return cls(**data)
+        values = dict(data)
+        legacy_subject = str(values.pop("subject", ""))
+        if legacy_subject:
+            key = "fix_subject" if values.get("fix_commit") else "intro_subject"
+            values.setdefault(key, legacy_subject)
+        values.setdefault("intro_subject", "")
+        values.setdefault("fix_subject", "")
+        return cls(**values)
 
 
 @dataclass
@@ -88,12 +99,19 @@ class RunResult:
     jev_cost_usd: float = 0.0
     findings: List[Finding] = field(default_factory=list)
     report_markdown: str = ""
+    treatment_id: Optional[str] = None
     error: Optional[str] = None
     aborted: bool = False
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_creation_tokens
+            + self.jev_tokens
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -114,6 +132,8 @@ class FindingJudgment:
     finding_index: int
     verdict: PrecisionType
     rationale: str
+    matches_known_defect: bool = False
+    claim_group_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -130,6 +150,7 @@ class CaseGrading:
     repetition: int
     known_defect_verdict: VerdictType
     finding_judgments: List[FindingJudgment] = field(default_factory=list)
+    grading_method: str = "location_proxy"
     human_spot_checked: bool = False
     human_notes: str = ""
 
@@ -140,6 +161,7 @@ class CaseGrading:
             "repetition": self.repetition,
             "known_defect_verdict": self.known_defect_verdict,
             "finding_judgments": [j.to_dict() for j in self.finding_judgments],
+            "grading_method": self.grading_method,
             "human_spot_checked": self.human_spot_checked,
             "human_notes": self.human_notes,
         }
@@ -153,6 +175,7 @@ class CaseGrading:
             repetition=data["repetition"],
             known_defect_verdict=data["known_defect_verdict"],
             finding_judgments=judgments,
+            grading_method=data.get("grading_method", "location_proxy"),
             human_spot_checked=data.get("human_spot_checked", False),
             human_notes=data.get("human_notes", ""),
         )

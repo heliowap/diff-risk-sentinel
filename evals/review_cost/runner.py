@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 import concurrent.futures
 import threading
@@ -29,17 +31,17 @@ ARM_B_INSTRUCTIONS = """You are conducting a sentinel-assisted code review (ARM 
 Your goal is to identify concrete functional defects, regressions, contract violations, or unhandled edge cases introduced by this change.
 
 WORKFLOW:
-1. Run triage: `diff-risk-sentinel --base {base_commit}..{target_commit} --top 20 --jev --output {sentinel_json}`
-2. Generate spec worksheet: `python3 {worksheet_script} {sentinel_json} --repo . --max 8 > {worksheet_md}`
-3. For each top production target, inspect the new revision, read its contract, and fill the spec:
+1. Read the precomputed Sentinel triage report at {sentinel_json} and the spec worksheet (produced by spec_worksheet.py) at {worksheet_md}.
+2. For each top production target, inspect the new revision, read its contract, and fill the spec:
    - What changed
    - Contract & Invariants
    - Suspected defects / risks
    - Given/When/Then test cases
-4. Conduct the explicit second pass:
+3. Conduct the explicit second pass:
    - Neighbours: small behavior edits in the same files as the top targets.
    - Consumers: untouched callers or readers of changed contracts, formats, or payloads.
    - Deploy transition: data formats, stale cache keys, or migrations mid-way.
+4. The Sentinel report meta block contains a `treatment_id` and the worksheet ends with a `Treatment-ID:` line. Copy that marker verbatim into the `treatment_id` field of your output JSON.
 5. Do not run tests or modify code.
 6. Output your findings strictly conforming to the required JSON schema at the end.
 """
@@ -58,7 +60,8 @@ You must provide your review output containing a JSON block with the following s
       "severity": "critical"
     }
   ],
-  "report_markdown": "# Risk triage: ...\\n## Findings first\\n..."
+  "report_markdown": "# Risk triage: ...\\n## Findings first\\n...",
+  "treatment_id": "optional; ARM B must copy the Treatment-ID marker from the sentinel artifacts"
 }
 ```
 Severities must be one of: "critical", "major", "minor".
@@ -72,6 +75,75 @@ def _find_worksheet_script() -> str:
         return str(claude_skill)
     repo_script = Path(__file__).resolve().parent.parent.parent / "scripts" / "spec_worksheet.py"
     return str(repo_script)
+
+
+@dataclass(frozen=True)
+class SentinelArtifacts:
+    sentinel_path: Path
+    worksheet_path: Path
+    treatment_id: str
+    jev_tokens: int = 0
+    jev_cost_usd: float = 0.0
+
+
+def build_sentinel_artifacts(
+    case: CaseConfig,
+    repo_path: Path,
+    sentinel_path: Path,
+    worksheet_path: Path,
+) -> SentinelArtifacts:
+    """
+    Precomputes the Sentinel triage report and spec worksheet inside the
+    isolated repo, embeds a random treatment marker in both artifacts, and
+    returns real Jev usage read from the Sentinel metadata.
+    """
+    triage = subprocess.run(
+        [
+            "diff-risk-sentinel",
+            "--base", f"{case.base_commit}..{case.intro_commit}",
+            "--top", "20",
+            "--jev",
+            "--output", str(sentinel_path),
+        ],
+        cwd=str(repo_path),
+        capture_output=True,
+        text=True,
+    )
+    if triage.returncode != 0:
+        raise RuntimeError(f"sentinel triage failed: {triage.stderr.strip()}")
+    if not sentinel_path.exists():
+        raise RuntimeError(f"sentinel output missing: {sentinel_path}")
+
+    sentinel_data = json.loads(sentinel_path.read_text())
+    meta = sentinel_data.setdefault("meta", {})
+    jev_tokens = int(meta.get("jev_tokens", 0))
+    jev_cost_usd = float(meta.get("jev_cost_usd", 0.0))
+    treatment_id = secrets.token_hex(8)
+    meta["treatment_id"] = treatment_id
+    sentinel_path.write_text(json.dumps(sentinel_data, indent=2))
+
+    with open(worksheet_path, "w", encoding="utf-8") as out:
+        worksheet = subprocess.run(
+            ["python3", _find_worksheet_script(), str(sentinel_path), "--repo", ".", "--max", "8"],
+            cwd=str(repo_path),
+            stdout=out,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    if worksheet.returncode != 0:
+        raise RuntimeError(f"worksheet generation failed: {worksheet.stderr.strip()}")
+    if not worksheet_path.exists():
+        raise RuntimeError(f"worksheet output missing: {worksheet_path}")
+    with open(worksheet_path, "a", encoding="utf-8") as out:
+        out.write(f"\nTreatment-ID: {treatment_id}\n")
+
+    return SentinelArtifacts(
+        sentinel_path=sentinel_path,
+        worksheet_path=worksheet_path,
+        treatment_id=treatment_id,
+        jev_tokens=jev_tokens,
+        jev_cost_usd=jev_cost_usd,
+    )
 
 
 def build_review_prompt(
@@ -88,12 +160,12 @@ def build_review_prompt(
         sentinel_json=sentinel_out_path,
         worksheet_md=worksheet_path,
     )
+    subject_line = f"Introducing commit subject: {case.intro_subject}\n" if case.intro_subject else ""
     prompt = f"""# Code Review Task ({case.case_id}) - ARM {arm.upper()}
 
 Commit under review: {case.intro_commit}
 Base commit: {case.base_commit}
-Commit message: {case.subject}
-
+{subject_line}
 {formatted_instructions}
 
 {SCHEMA_INSTRUCTIONS}
@@ -111,7 +183,7 @@ def claude_command_runner(
 ) -> Dict[str, Any]:
     """
     Executes claude CLI non-interactively with structured JSON telemetry.
-    Arm A enforces --safe-mode (no skills or customizations).
+    Both arms run with --safe-mode (no skills or customizations).
     """
     cmd = [
         "claude",
@@ -119,11 +191,9 @@ def claude_command_runner(
         "-p",
         "--permission-mode", "auto",
         "--output-format", "json",
+        "--safe-mode",
+        prompt,
     ]
-    if arm.upper() == "A":
-        cmd.append("--safe-mode")
-
-    cmd.append(prompt)
 
     try:
         proc = subprocess.run(
@@ -183,11 +253,16 @@ def run_case_review(
     arm: str,
     repetition: int = 1,
     command_runner: Optional[Callable[[str, Path], Dict[str, Any]]] = None,
+    artifact_builder: Optional[
+        Callable[[CaseConfig, Path, Path, Path], SentinelArtifacts]
+    ] = None,
     work_base_dir: Optional[Path | str] = None,
     model: str = "sonnet",
 ) -> RunResult:
     """
     Executes a single review run for a case and arm in an isolated repository.
+    Arm B precomputes Sentinel artifacts and requires the review output to echo
+    the embedded treatment marker; a missing or mismatched marker aborts the run.
     """
     start_time = time.time()
     work_dir = tempfile.mkdtemp(prefix=f"review_{case.case_id}_{arm}_", dir=str(work_base_dir) if work_base_dir else None)
@@ -207,6 +282,24 @@ def run_case_review(
 
         sentinel_file = repo_dir / "sentinel.json"
         worksheet_file = repo_dir / "worksheet.md"
+
+        artifacts: Optional[SentinelArtifacts] = None
+        if arm.upper() == "B":
+            builder = artifact_builder or build_sentinel_artifacts
+            try:
+                artifacts = builder(case, repo_dir, sentinel_file, worksheet_file)
+            except Exception as e:
+                return RunResult(
+                    case_id=case.case_id,
+                    arm=arm.upper(),
+                    repetition=repetition,
+                    target_commit=case.intro_commit,
+                    base_commit=case.base_commit,
+                    duration_seconds=time.time() - start_time,
+                    error=f"sentinel artifact build failed: {e}",
+                    aborted=True,
+                )
+
         prompt = build_review_prompt(
             case,
             arm=arm,
@@ -216,13 +309,6 @@ def run_case_review(
 
         if command_runner:
             exec_res = command_runner(prompt, repo_dir)
-            raw_output = exec_res.get("output", "")
-            input_tokens = exec_res.get("input_tokens", 0)
-            output_tokens = exec_res.get("output_tokens", 0)
-            cost_usd = exec_res.get("cost_usd", 0.0)
-            jev_tokens = exec_res.get("jev_tokens", 0)
-            jev_cost_usd = exec_res.get("jev_cost_usd", 0.0)
-            err = exec_res.get("error")
         else:
             # Default to real claude CLI runner with isolated sentinel path
             exec_res = claude_command_runner(
@@ -232,16 +318,25 @@ def run_case_review(
                 model=model,
                 sentinel_out_path=sentinel_file,
             )
-            raw_output = exec_res.get("output", "")
-            input_tokens = exec_res.get("input_tokens", 0)
-            output_tokens = exec_res.get("output_tokens", 0)
-            cost_usd = exec_res.get("cost_usd", 0.0)
-            jev_tokens = exec_res.get("jev_tokens", 0)
-            jev_cost_usd = exec_res.get("jev_cost_usd", 0.0)
-            err = exec_res.get("error")
 
         duration = time.time() - start_time
-        review_out = parse_review_output(raw_output)
+        review_out = parse_review_output(exec_res.get("output", ""))
+
+        err = exec_res.get("error")
+        aborted = False
+        if artifacts is not None and review_out.treatment_id != artifacts.treatment_id:
+            aborted = True
+            err = err or (
+                "treatment attestation failed: review output marker "
+                f"{review_out.treatment_id!r} does not match artifact marker"
+            )
+
+        if artifacts is not None:
+            jev_tokens = artifacts.jev_tokens
+            jev_cost_usd = artifacts.jev_cost_usd
+        else:
+            jev_tokens = exec_res.get("jev_tokens", 0)
+            jev_cost_usd = exec_res.get("jev_cost_usd", 0.0)
 
         return RunResult(
             case_id=case.case_id,
@@ -250,14 +345,18 @@ def run_case_review(
             target_commit=case.intro_commit,
             base_commit=case.base_commit,
             duration_seconds=duration,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=cost_usd,
+            input_tokens=exec_res.get("input_tokens", 0),
+            output_tokens=exec_res.get("output_tokens", 0),
+            cache_read_tokens=exec_res.get("cache_read_tokens", 0),
+            cache_creation_tokens=exec_res.get("cache_creation_tokens", 0),
+            cost_usd=exec_res.get("cost_usd", 0.0),
             jev_tokens=jev_tokens,
             jev_cost_usd=jev_cost_usd,
             findings=review_out.findings,
             report_markdown=review_out.report_markdown,
+            treatment_id=review_out.treatment_id,
             error=err,
+            aborted=aborted,
         )
 
     finally:

@@ -75,11 +75,13 @@ def verify_consumer_with_jev(
     )
 
     resp = ask_jev(api_key, state, CONSUMER_QUESTIONS, timeout=timeout)
+
     if "error" in resp:
         return {
-            "is_broken": False,
-            "broken_probability": 0.0,
-            "verdict": "ERROR",
+            "is_broken": None,
+            "broken_probability": None,
+            "verdict": "UNKNOWN",
+            "usage": resp.get("usage", {}),
             "error": resp["error"],
         }
 
@@ -91,4 +93,5 @@ def verify_consumer_with_jev(
         "is_broken": is_broken,
         "broken_probability": broken_prob,
         "verdict": "PROBABLE_CONTRACT_BREAK" if is_broken else "COMPATIBLE",
+        "usage": resp.get("usage", {}),
     }

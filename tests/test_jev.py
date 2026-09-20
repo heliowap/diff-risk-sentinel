@@ -52,10 +52,20 @@ class TestQueryJevFunction(unittest.TestCase):
         finally:
             srv.close()
         self.assertEqual(answer, {"introduces_bug": 0.7, "edge_cases": 0.4, "behavior_change": 2.5,
-                                  "semantic_risk": 1.5, "confidence": 0.6})
+                                  "semantic_risk": 1.5, "confidence": 0.6, "usage": {}})
         sent = srv.received[0]
         self.assertEqual(sent["state"]["new_code"], STATE["new_code"])
         self.assertEqual(set(sent["questions"]), set(JEV_DIMENSIONS))
+
+    def test_usage_is_propagated(self):
+        srv = _Server([(200, {**GOOD, "usage": {"input_tokens": 100, "output_tokens": 20,
+                                               "cost_usd": 0.004}})])
+        try:
+            answer = query_jev_function("key", STATE, api_url=srv.url)
+        finally:
+            srv.close()
+        self.assertEqual(answer["usage"],
+                         {"input_tokens": 100, "output_tokens": 20, "cost_usd": 0.004})
 
     def test_retries_rate_limits_then_succeeds(self):
         srv = _Server([(429, {"error": "slow down"}), (200, GOOD)])

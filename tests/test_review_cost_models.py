@@ -23,6 +23,21 @@ class TestReviewCostModels(unittest.TestCase):
         self.assertEqual(f.severity, "critical")
         self.assertEqual(f.to_dict()["line"], 42)
 
+    def test_legacy_fix_subject_is_not_treated_as_intro_subject(self):
+        case = CaseConfig.from_dict({
+            "case_id": "small_01",
+            "intro_commit": "a" * 40,
+            "base_commit": "a" * 40 + "~1",
+            "category": "small",
+            "touched_production_functions": 3,
+            "fix_commit": "b" * 40,
+            "fixed_functions": {"src/example.py": ["calculate"]},
+            "subject": "fix: correct calculation",
+        })
+        self.assertEqual(case.intro_subject, "")
+        self.assertEqual(case.fix_subject, "fix: correct calculation")
+        self.assertNotIn("subject", case.to_dict())
+
     def test_parse_review_output_clean_json(self):
         raw = """{
             "findings": [
@@ -64,6 +79,11 @@ Done!"""
         self.assertEqual(len(out.findings), 1)
         self.assertEqual(out.findings[0].function, "verify_token")
 
+    def test_parse_review_output_preserves_treatment_id(self):
+        raw = '{"findings": [], "report_markdown": "ok", "treatment_id": "marker-1"}'
+        out = parse_review_output(raw)
+        self.assertEqual(out.treatment_id, "marker-1")
+
     def test_parse_review_output_handles_empty_or_malformed(self):
         out = parse_review_output("I found no structured json")
         self.assertEqual(len(out.findings), 0)
@@ -97,6 +117,6 @@ Done!"""
         )
         d = res.to_dict()
         self.assertEqual(d["case_id"], "case_001")
-        self.assertEqual(d["total_tokens"], 1500 + 350)
+        self.assertEqual(d["total_tokens"], 1500 + 350 + 500 + 100 + 4000)
         self.assertEqual(len(d["findings"]), 1)
         self.assertEqual(d["findings"][0]["claim"], "bug")

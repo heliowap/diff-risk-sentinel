@@ -66,3 +66,39 @@ class TestConsumerVerifier(unittest.TestCase):
         self.assertFalse(res["is_broken"])
         self.assertAlmostEqual(res["broken_probability"], 0.08)
         self.assertEqual(res["verdict"], "COMPATIBLE")
+
+    @patch("diff_risk_sentinel.consumer_verifier.ask_jev")
+    def test_verify_consumer_error_is_unknown(self, mock_ask):
+        mock_ask.return_value = {"error": "TimeoutError: timed out", "usage": {"input_tokens": 12}}
+        res = verify_consumer_with_jev(
+            api_key="fake-key",
+            token="calc_tax",
+            producer_file="src/billing.py",
+            producer_diff="-def calc_tax(amount):",
+            consumer_file="src/orders.py",
+            consumer_function="checkout",
+            consumer_code="def checkout(order):\n    return calc_tax(order.amount)\n",
+        )
+        self.assertEqual(res["verdict"], "UNKNOWN")
+        self.assertIsNone(res["is_broken"])
+        self.assertIsNone(res["broken_probability"])
+        self.assertEqual(res["error"], "TimeoutError: timed out")
+        self.assertEqual(res["usage"], {"input_tokens": 12})
+
+    @patch("diff_risk_sentinel.consumer_verifier.ask_jev")
+    def test_verify_consumer_records_real_jev_usage(self, mock_ask):
+        mock_ask.return_value = {
+            "answers": {"contract_broken": {"noul": 0.1}},
+            "usage": {"input_tokens": 500, "output_tokens": 40, "cost_usd": 0.001},
+        }
+        res = verify_consumer_with_jev(
+            api_key="fake-key",
+            token="STATUS_OK",
+            producer_file="src/constants.py",
+            producer_diff="+STATUS_OK = 'OK'",
+            consumer_file="src/orders.py",
+            consumer_function="is_ready",
+            consumer_code="def is_ready(status):\n    return status == STATUS_OK\n",
+        )
+        self.assertEqual(res["usage"],
+                         {"input_tokens": 500, "output_tokens": 40, "cost_usd": 0.001})

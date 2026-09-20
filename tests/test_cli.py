@@ -154,6 +154,21 @@ class TestRunSentinel(unittest.TestCase):
         self.assertIn("falha", out.lower())
         self.assertTrue(all(t["jev_semantic_risk"] is None for t in payload["targets"]))
 
+    def test_jev_usage_is_aggregated_into_meta(self):
+        usage = {"input_tokens": 100, "output_tokens": 20, "cost_usd": 0.004}
+
+        def answer(api_key, state, **kw):
+            return {"introduces_bug": 0.1, "edge_cases": 0.1, "behavior_change": 1.0,
+                    "semantic_risk": 1.0, "confidence": 0.5, "usage": usage}
+
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "k"}), \
+                mock.patch("diff_risk_sentinel.cli.query_jev_function", side_effect=answer):
+            _, payload, _ = self.run_it(jev=True)
+        meta = payload["meta"]
+        self.assertEqual(meta["jev_usage"], {"input_tokens": 200, "output_tokens": 40, "cost_usd": 0.008})
+        self.assertEqual(meta["jev_tokens"], 240)
+        self.assertAlmostEqual(meta["jev_cost_usd"], 0.008)
+
     def test_coverage_report_relative_to_package_is_applied(self):
         xml = ('<?xml version="1.0"?><coverage><sources><source>{src}</source></sources><packages><package>'
                '<classes><class filename="mod.py"><lines>{lines}</lines></class></classes>'

@@ -96,7 +96,14 @@ def analyze_fix(repo: str, fix: str, subject: str) -> Optional[Dict]:
                 fixed[path] = sorted(names)
         if not fixed:
             return None
-        return {"fix": fix, "subject": subject, "intro": intro, "fixed_functions": fixed}
+        intro_subject = run_git(["show", "-s", "--format=%s", intro], repo).strip()
+        return {
+            "fix": fix,
+            "fix_subject": subject,
+            "intro": intro,
+            "intro_subject": intro_subject,
+            "fixed_functions": fixed,
+        }
     except GitError:
         return None
 

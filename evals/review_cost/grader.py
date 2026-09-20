@@ -1,19 +1,8 @@
 from __future__ import annotations
 
-import re
-from typing import List, Sequence, Set
+from typing import List, Optional, Sequence
 
-from evals.review_cost.models import CaseConfig, CaseGrading, Finding, FindingJudgment, PrecisionType, VerdictType
-
-
-def _clean_tokens(text: str) -> Set[str]:
-    words = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", text.lower())
-    stop_words = {
-        "the", "and", "for", "with", "this", "that", "from", "when", "into",
-        "self", "def", "return", "none", "true", "false", "file", "line",
-        "code", "function", "method", "class", "error", "issue", "bug", "fix",
-    }
-    return {w for w in words if w not in stop_words}
+from evals.review_cost.models import CaseConfig, CaseGrading, Finding, FindingJudgment, VerdictType
 
 
 def match_function_name(candidate: str, targets: Sequence[str]) -> bool:
@@ -108,85 +97,82 @@ def grade_case_findings(
     fix_message: str = "",
     arm: str = "A",
     repetition: int = 1,
+    semantic_judgments: Optional[Sequence[FindingJudgment]] = None,
 ) -> CaseGrading:
     """
-    Blind-grades a list of findings against ground truth (the subsequent fix commit).
-    Evaluates:
-      - known_defect_verdict: 'found' | 'near' | 'missed'
-      - finding_judgments: precision verdict per finding
-    """
-    judgments: List[FindingJudgment] = []
-    fixed_targets = case.fixed_functions
+    Grades a list of findings against ground truth (the subsequent fix commit).
 
-    # On clean commits, there is no known defect to find
-    if case.category == "clean" or not fixed_targets:
-        for idx, f in enumerate(findings):
-            # Any critical/major bug reported on a clean diff is a candidate false positive
-            verdict: PrecisionType = "incorrect" if f.severity in ("critical", "major") else "unverifiable"
-            judgments.append(
-                FindingJudgment(
-                    finding_index=idx,
-                    verdict=verdict,
-                    rationale="Reported on verified clean commit without defect fixes.",
+    With `semantic_judgments` (from blind semantic grading), verdicts are copied
+    verbatim and `known_defect_verdict` is "found" only when a "correct" judgment
+    has `matches_known_defect=True`. Without them, grading is a location proxy:
+    findings are never marked "correct", matches against fixed files/functions
+    yield "near", and per-finding verdicts stay "unverifiable".
+    """
+    fixed_targets = case.fixed_functions
+    is_clean = case.category == "clean" or not fixed_targets
+
+    if semantic_judgments is not None:
+        for j in semantic_judgments:
+            if not 0 <= j.finding_index < len(findings):
+                raise ValueError(
+                    f"semantic judgment index {j.finding_index} out of range for {len(findings)} findings"
                 )
-            )
+        verdict: VerdictType = "missed"
+        if not is_clean:
+            if any(j.verdict == "correct" and j.matches_known_defect for j in semantic_judgments):
+                verdict = "found"
+            elif any(
+                match_finding_to_targets(f.file, f.function, fixed_targets) != (False, False)
+                for f in findings
+            ):
+                verdict = "near"
         return CaseGrading(
             case_id=case.case_id,
             arm=arm,
             repetition=repetition,
-            known_defect_verdict="missed",
-            finding_judgments=judgments,
+            known_defect_verdict=verdict,
+            finding_judgments=list(semantic_judgments),
+            grading_method="semantic",
         )
 
-    # Defect-bearing commit
-    fix_tokens = _clean_tokens(f"{fix_message}\n{fix_diff}")
-    known_defect_verdict: VerdictType = "missed"
+    judgments: List[FindingJudgment] = []
     matched_any_target = False
 
-    for idx, f in enumerate(findings):
-        file_matched, func_matched = match_finding_to_targets(f.file, f.function, fixed_targets)
-        finding_tokens = _clean_tokens(f.claim)
-        token_overlap = len(finding_tokens & fix_tokens)
-
-        if func_matched:
-            matched_any_target = True
-            # Check if claim describes the fix problem
-            if token_overlap >= 1 or any(t in f.claim.lower() for t in ("none", "null", "type", "bound", "key", "index", "order", "effect", "reload", "quick", "reply", "unidade", "channel")):
-                known_defect_verdict = "found"
-                verdict = "correct"
-                rationale = f"Matches fixed function {f.function} and problem alignment with fix ({token_overlap} overlapping terms)."
-            else:
-                if known_defect_verdict != "found":
-                    known_defect_verdict = "near"
-                verdict = "unverifiable"
-                rationale = f"Matches fixed function {f.function} but claims a different or general issue."
-        elif file_matched:
-            matched_any_target = True
-            if known_defect_verdict not in ("found",):
-                known_defect_verdict = "near"
-            verdict = "unverifiable"
-            rationale = f"Matches fixed file {f.file} but different function."
-        else:
-            verdict = "unverifiable"
-            rationale = "Finding on function outside ground-truth fix commit."
-
-        judgments.append(
-            FindingJudgment(
-                finding_index=idx,
-                verdict=verdict,
-                rationale=rationale,
+    if is_clean:
+        for idx, f in enumerate(findings):
+            judgments.append(
+                FindingJudgment(
+                    finding_index=idx,
+                    verdict="unverifiable",
+                    rationale="Location proxy cannot establish correctness on a clean commit.",
+                )
             )
-        )
-
-    if not matched_any_target:
-        known_defect_verdict = "missed"
+    else:
+        for idx, f in enumerate(findings):
+            file_matched, func_matched = match_finding_to_targets(f.file, f.function, fixed_targets)
+            if func_matched:
+                matched_any_target = True
+                rationale = f"Matches fixed function {f.function}; correctness requires semantic judgment."
+            elif file_matched:
+                matched_any_target = True
+                rationale = f"Matches fixed file {f.file} but different function."
+            else:
+                rationale = "Finding on function outside ground-truth fix commit."
+            judgments.append(
+                FindingJudgment(
+                    finding_index=idx,
+                    verdict="unverifiable",
+                    rationale=rationale,
+                )
+            )
 
     return CaseGrading(
         case_id=case.case_id,
         arm=arm,
         repetition=repetition,
-        known_defect_verdict=known_defect_verdict,
+        known_defect_verdict="near" if (matched_any_target and not is_clean) else "missed",
         finding_judgments=judgments,
+        grading_method="location_proxy",
     )
 
 
@@ -215,13 +201,20 @@ Function: {finding.function}
 Severity: {finding.severity}
 Claim: {finding.claim}
 
-QUESTIONS:
-1. Does this finding identify the actual defect addressed by the fix commit? (YES/NO)
-2. Is the finding:
-   - CORRECT (identifies a real defect or violation)
-   - INCORRECT (hallucination or false positive)
-   - UNVERIFIABLE (speculative or benign observation)
-Provide your brief rationale.
+Answer strictly as a JSON object:
+```json
+{
+  "verdict": "correct | incorrect | unverifiable",
+  "matches_known_defect": true,
+  "claim_group_id": "short stable identifier for the underlying defect",
+  "rationale": "brief justification"
+}
+```
+Rules:
+- "correct" requires the claim to describe a genuine defect in the cited code; a matching file or function name alone is not enough.
+- A novel, real defect that is NOT the one fixed by the ground-truth commit is still "correct" with "matches_known_defect": false.
+- Claims describing the same underlying defect share the same non-empty "claim_group_id"; unrelated claims get distinct ids.
+- Use "unverifiable" when the claim is speculative, stylistic, or cannot be confirmed from the evidence.
 """
 
 
