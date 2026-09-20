@@ -15,7 +15,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from diff_risk_sentinel.consumer_verifier import verify_consumer_with_jev
 from diff_risk_sentinel.finding_verifier import verify_finding_with_jev
@@ -29,22 +29,43 @@ def evaluate_stage6_on_runs(
     cases: Dict[str, CaseConfig],
     repo_path: str,
     api_key: str,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], List[Any], List[Any], List[RunResult]]:
     """
     Evaluates Stage 6 (Jev finding verifier) on review runs:
     Measures precision and defect recall BEFORE and AFTER the Jev filter.
     """
-    before_findings_count = 0
-    after_findings_count = 0
-    pruned_count = 0
-    retained_real_defects = 0
-
     results_by_arm: Dict[str, Dict[str, Any]] = {"A": {}, "B": {}}
+    all_gradings_before = []
+    all_gradings_after = []
+    filtered_runs: List[RunResult] = []
+
+    fix_cache: Dict[str, Tuple[str, str]] = {}
+
+    def _get_fix_info(case: CaseConfig) -> Tuple[str, str]:
+        if not case.fix_commit:
+            return "", ""
+        if case.fix_commit not in fix_cache:
+            m_res = subprocess.run(
+                ["git", "-C", repo_path, "log", "-1", "--format=%B", case.fix_commit],
+                capture_output=True,
+                text=True,
+            )
+            msg = m_res.stdout.strip() if m_res.returncode == 0 else ""
+            d_res = subprocess.run(
+                ["git", "-C", repo_path, "diff", f"{case.fix_commit}~1..{case.fix_commit}"],
+                capture_output=True,
+                text=True,
+            )
+            diff = d_res.stdout if d_res.returncode == 0 else ""
+            fix_cache[case.fix_commit] = (msg, diff)
+        return fix_cache[case.fix_commit]
 
     for arm in ("A", "B"):
         arm_runs = [r for r in runs if r.arm == arm]
         raw_judgments_before: List[str] = []
         raw_judgments_after: List[str] = []
+        arm_gradings_before = []
+        arm_gradings_after = []
 
         total_jev_tokens = 0
         total_jev_time = 0.0
@@ -54,15 +75,20 @@ def evaluate_stage6_on_runs(
             if not case:
                 continue
 
+            fix_msg, fix_diff = _get_fix_info(case)
+
             # Grade before
-            g_before = grade_case_findings(case, r.findings, arm=arm, repetition=r.repetition)
+            g_before = grade_case_findings(
+                case, r.findings, fix_diff=fix_diff, fix_message=fix_msg, arm=arm, repetition=r.repetition
+            )
+            arm_gradings_before.append(g_before)
+            all_gradings_before.append(g_before)
             for j in g_before.finding_judgments:
                 raw_judgments_before.append(j.verdict)
 
             # Apply Stage 6 Jev Verifier to each finding
             filtered_findings: List[Finding] = []
             for idx, f in enumerate(r.findings):
-                before_findings_count += 1
                 # Fetch cited code context
                 show_res = subprocess.run(
                     ["git", "-C", repo_path, "show", f"{case.intro_commit}:{f.file}"],
@@ -83,7 +109,6 @@ def evaluate_stage6_on_runs(
                 total_jev_tokens += 430  # average ~370 in + 60 out
 
                 if v_res["is_valid"]:
-                    after_findings_count += 1
                     # Update finding severity if calibrated by Jev
                     f_calibrated = Finding(
                         file=f.file,
@@ -93,13 +118,34 @@ def evaluate_stage6_on_runs(
                         severity=v_res["calibrated_severity"],
                     )
                     filtered_findings.append(f_calibrated)
-                else:
-                    pruned_count += 1
 
             # Grade after
-            g_after = grade_case_findings(case, filtered_findings, arm=arm, repetition=r.repetition)
+            g_after = grade_case_findings(
+                case, filtered_findings, fix_diff=fix_diff, fix_message=fix_msg, arm=arm, repetition=r.repetition
+            )
+            arm_gradings_after.append(g_after)
+            all_gradings_after.append(g_after)
             for j in g_after.finding_judgments:
                 raw_judgments_after.append(j.verdict)
+
+            # Record filtered RunResult
+            run_after = RunResult(
+                case_id=r.case_id,
+                arm=r.arm,
+                repetition=r.repetition,
+                target_commit=r.target_commit,
+                base_commit=r.base_commit,
+                duration_seconds=r.duration_seconds + (total_jev_time / max(1, len(arm_runs))),
+                input_tokens=r.input_tokens + int(total_jev_tokens * 0.85),
+                output_tokens=r.output_tokens + int(total_jev_tokens * 0.15),
+                cost_usd=r.cost_usd + (total_jev_tokens * 0.000002),
+                jev_tokens=r.jev_tokens + total_jev_tokens,
+                jev_cost_usd=r.jev_cost_usd + (total_jev_tokens * 0.000002),
+                findings=filtered_findings,
+                report_markdown=r.report_markdown,
+                error=r.error,
+            )
+            filtered_runs.append(run_after)
 
         prec_before = (
             raw_judgments_before.count("correct") / len(raw_judgments_before)
@@ -112,19 +158,29 @@ def evaluate_stage6_on_runs(
             else 0.0
         )
 
+        n_cases = max(1, len(arm_gradings_before))
+        rec_found_before = sum(1 for g in arm_gradings_before if g.known_defect_verdict == "found") / n_cases
+        rec_near_before = sum(1 for g in arm_gradings_before if g.known_defect_verdict in ("found", "near")) / n_cases
+        rec_found_after = sum(1 for g in arm_gradings_after if g.known_defect_verdict == "found") / n_cases
+        rec_near_after = sum(1 for g in arm_gradings_after if g.known_defect_verdict in ("found", "near")) / n_cases
+
         results_by_arm[arm] = {
             "total_findings_before": len(raw_judgments_before),
             "correct_before": raw_judgments_before.count("correct"),
             "precision_before": prec_before,
+            "recall_found_before": rec_found_before,
+            "recall_near_before": rec_near_before,
             "total_findings_after": len(raw_judgments_after),
             "correct_after": raw_judgments_after.count("correct"),
             "precision_after": prec_after,
+            "recall_found_after": rec_found_after,
+            "recall_near_after": rec_near_after,
             "pruned_findings": len(raw_judgments_before) - len(raw_judgments_after),
             "total_jev_tokens": total_jev_tokens,
             "total_jev_time_s": total_jev_time,
         }
 
-    return results_by_arm
+    return results_by_arm, all_gradings_before, all_gradings_after, filtered_runs
 
 
 def evaluate_consumer_verifier_on_cases(
@@ -211,7 +267,9 @@ def main() -> None:
         cases_map = {c.case_id: c for c in cases_list}
 
     print("Running Stage 6 Finding Verifier evaluation...", flush=True)
-    stage6_results = evaluate_stage6_on_runs(runs, cases_map, args.source_repo, api_key)
+    stage6_results, gradings_before, gradings_after, runs_after = evaluate_stage6_on_runs(
+        runs, cases_map, args.source_repo, api_key
+    )
 
     print("Running Consumer Contract Verifier evaluation...", flush=True)
     consumer_results = evaluate_consumer_verifier_on_cases(cases_list, args.source_repo, api_key)
@@ -226,7 +284,17 @@ def main() -> None:
         out_p.parent.mkdir(parents=True, exist_ok=True)
         with open(out_p, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
-        print(f"Results saved to {out_p}")
+
+        with open(out_p.parent / "gradings_before.json", "w", encoding="utf-8") as f:
+            json.dump([g.to_dict() for g in gradings_before], f, indent=2)
+
+        with open(out_p.parent / "gradings_after.json", "w", encoding="utf-8") as f:
+            json.dump([g.to_dict() for g in gradings_after], f, indent=2)
+
+        with open(out_p.parent / "runs_after.json", "w", encoding="utf-8") as f:
+            json.dump([r.to_dict() for r in runs_after], f, indent=2)
+
+        print(f"Results saved to {out_p} (and companion gradings/runs)")
 
     print("\n" + "=" * 60)
     print("RESUMO DA NOVA ARQUITETURA (STAGE 6 & CONSUMERS):")

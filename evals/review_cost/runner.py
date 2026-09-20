@@ -8,7 +8,9 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence
+import concurrent.futures
+import threading
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from evals.review_cost.models import CaseConfig, Finding, ReviewOutput, RunResult, parse_review_output
 from evals.review_cost.prepare_isolated_repo import prepare_isolated_repo
@@ -27,8 +29,8 @@ ARM_B_INSTRUCTIONS = """You are conducting a sentinel-assisted code review (ARM 
 Your goal is to identify concrete functional defects, regressions, contract violations, or unhandled edge cases introduced by this change.
 
 WORKFLOW:
-1. Run triage: `diff-risk-sentinel --base {base_commit}..{target_commit} --top 20 --jev --output /tmp/sentinel.json`
-2. Generate spec worksheet: `python3 {worksheet_script} /tmp/sentinel.json --repo . --max 8 > /tmp/worksheet.md`
+1. Run triage: `diff-risk-sentinel --base {base_commit}..{target_commit} --top 20 --jev --output {sentinel_json}`
+2. Generate spec worksheet: `python3 {worksheet_script} {sentinel_json} --repo . --max 8 > {worksheet_md}`
 3. For each top production target, inspect the new revision, read its contract, and fill the spec:
    - What changed
    - Contract & Invariants
@@ -72,12 +74,19 @@ def _find_worksheet_script() -> str:
     return str(repo_script)
 
 
-def build_review_prompt(case: CaseConfig, arm: str) -> str:
+def build_review_prompt(
+    case: CaseConfig,
+    arm: str,
+    sentinel_out_path: str = "/tmp/sentinel.json",
+    worksheet_path: str = "/tmp/worksheet.md",
+) -> str:
     instructions = ARM_A_INSTRUCTIONS if arm.upper() == "A" else ARM_B_INSTRUCTIONS
     formatted_instructions = instructions.format(
         base_commit=case.base_commit,
         target_commit=case.intro_commit,
         worksheet_script=_find_worksheet_script(),
+        sentinel_json=sentinel_out_path,
+        worksheet_md=worksheet_path,
     )
     prompt = f"""# Code Review Task ({case.case_id}) - ARM {arm.upper()}
 
@@ -98,6 +107,7 @@ def claude_command_runner(
     arm: str,
     model: str = "sonnet",
     timeout_seconds: int = 600,
+    sentinel_out_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Executes claude CLI non-interactively with structured JSON telemetry.
@@ -137,16 +147,18 @@ def claude_command_runner(
         cost = float(data.get("total_cost_usd", 0.0))
 
         # Check for Jev tokens if sentinel output was generated
-        sentinel_out = Path("/tmp/sentinel.json")
+        sentinel_out = sentinel_out_path or Path("/tmp/sentinel.json")
         jev_tokens = 0
         jev_cost = 0.0
-        if arm.upper() == "B" and sentinel_out.exists():
-            try:
-                sdata = json.loads(sentinel_out.read_text())
-                jev_tokens = int(sdata.get("meta", {}).get("jev_tokens", 0))
-                jev_cost = float(sdata.get("meta", {}).get("jev_cost_usd", 0.0))
-            except Exception:
-                pass
+        if arm.upper() == "B":
+            target_f = sentinel_out if (sentinel_out and sentinel_out.exists()) else Path("/tmp/sentinel.json")
+            if target_f.exists():
+                try:
+                    sdata = json.loads(target_f.read_text())
+                    jev_tokens = int(sdata.get("meta", {}).get("jev_tokens", 0))
+                    jev_cost = float(sdata.get("meta", {}).get("jev_cost_usd", 0.0))
+                except Exception:
+                    pass
 
         return {
             "output": result,
@@ -172,6 +184,7 @@ def run_case_review(
     repetition: int = 1,
     command_runner: Optional[Callable[[str, Path], Dict[str, Any]]] = None,
     work_base_dir: Optional[Path | str] = None,
+    model: str = "sonnet",
 ) -> RunResult:
     """
     Executes a single review run for a case and arm in an isolated repository.
@@ -192,7 +205,14 @@ def run_case_review(
             unreachable_commits=unreachable,
         )
 
-        prompt = build_review_prompt(case, arm=arm)
+        sentinel_file = repo_dir / "sentinel.json"
+        worksheet_file = repo_dir / "worksheet.md"
+        prompt = build_review_prompt(
+            case,
+            arm=arm,
+            sentinel_out_path=str(sentinel_file),
+            worksheet_path=str(worksheet_file),
+        )
 
         if command_runner:
             exec_res = command_runner(prompt, repo_dir)
@@ -204,8 +224,14 @@ def run_case_review(
             jev_cost_usd = exec_res.get("jev_cost_usd", 0.0)
             err = exec_res.get("error")
         else:
-            # Default to real claude CLI runner
-            exec_res = claude_command_runner(prompt, repo_dir, arm=arm)
+            # Default to real claude CLI runner with isolated sentinel path
+            exec_res = claude_command_runner(
+                prompt,
+                repo_dir,
+                arm=arm,
+                model=model,
+                sentinel_out_path=sentinel_file,
+            )
             raw_output = exec_res.get("output", "")
             input_tokens = exec_res.get("input_tokens", 0)
             output_tokens = exec_res.get("output_tokens", 0)
@@ -246,6 +272,8 @@ def main() -> None:
     parser.add_argument("--arms", default="A,B", help="Comma-separated arms to run (e.g. A,B)")
     parser.add_argument("--repetitions", type=int, default=1, help="Repetitions per case")
     parser.add_argument("--model", default="sonnet", help="Claude model name (default: sonnet)")
+    parser.add_argument("--workers", type=int, default=4, help="Number of concurrent workers (default: 4)")
+    parser.add_argument("--force", action="store_true", help="Re-run existing cases")
 
     args = parser.parse_args()
 
@@ -256,28 +284,69 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     arms = [a.strip().upper() for a in args.arms.split(",") if a.strip()]
+    runs_file = out_dir / "runs.json"
     results: List[RunResult] = []
+    completed_keys: Set[Tuple[str, str, int]] = set()
 
+    if runs_file.exists() and not args.force:
+        try:
+            with open(runs_file, "r", encoding="utf-8") as f:
+                prev_runs = [RunResult.from_dict(r) for r in json.load(f)]
+                results.extend(prev_runs)
+                completed_keys = {(r.case_id, r.arm, r.repetition) for r in prev_runs}
+                print(f"Loaded {len(results)} existing runs from {runs_file}")
+        except Exception as e:
+            print(f"Warning loading existing runs: {e}")
+
+    tasks: List[Tuple[CaseConfig, str, int]] = []
     for case in cases:
         for arm in arms:
             for rep in range(1, args.repetitions + 1):
-                print(f"Running Case: {case.case_id} | Arm: {arm} | Rep: {rep} ...", flush=True)
-                res = run_case_review(
-                    case=case,
-                    source_repo=args.source_repo,
-                    arm=arm,
-                    repetition=rep,
-                    command_runner=lambda p, r, _a=arm: claude_command_runner(p, r, arm=_a, model=args.model),
-                )
-                results.append(res)
-                print(f"  Done in {res.duration_seconds:.1f}s | Tokens: {res.total_tokens} | Cost: ${res.cost_usd:.4f} | Findings: {len(res.findings)}", flush=True)
+                if (case.case_id, arm, rep) in completed_keys:
+                    print(f"Skipping completed: Case {case.case_id} | Arm {arm} | Rep {rep}")
+                    continue
+                tasks.append((case, arm, rep))
 
-                # Save incremental results
-                runs_file = out_dir / "runs.json"
-                with open(runs_file, "w", encoding="utf-8") as f:
-                    json.dump([r.to_dict() for r in results], f, indent=2)
+    lock = threading.Lock()
+    total_tasks = len(tasks)
+    finished_count = len(completed_keys)
 
-    print(f"Finished {len(results)} runs. Saved to {out_dir / 'runs.json'}")
+    def _execute(task_info: Tuple[CaseConfig, str, int]) -> RunResult:
+        c, a, r = task_info
+        return run_case_review(
+            case=c,
+            source_repo=args.source_repo,
+            arm=a,
+            repetition=r,
+            model=args.model,
+        )
+
+    if tasks:
+        print(f"Executing {total_tasks} runs with {args.workers} workers...", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_task = {executor.submit(_execute, t): t for t in tasks}
+            for future in concurrent.futures.as_completed(future_to_task):
+                task_info = future_to_task[future]
+                try:
+                    res = future.result()
+                    with lock:
+                        finished_count += 1
+                        results.append(res)
+                        print(
+                            f"[{finished_count}/{total_tasks + len(completed_keys)}] Done Case: {res.case_id} | "
+                            f"Arm: {res.arm} | Rep: {res.repetition} | "
+                            f"Time: {res.duration_seconds:.1f}s | Tokens: {res.total_tokens} | "
+                            f"Cost: ${res.cost_usd:.4f} | Findings: {len(res.findings)}",
+                            flush=True,
+                        )
+                        tmp_runs = out_dir / "runs.json.tmp"
+                        with open(tmp_runs, "w", encoding="utf-8") as f:
+                            json.dump([r.to_dict() for r in results], f, indent=2)
+                        tmp_runs.replace(runs_file)
+                except Exception as exc:
+                    print(f"Error executing {task_info[0].case_id} Arm {task_info[1]}: {exc}", flush=True)
+
+    print(f"Finished. Total runs: {len(results)}. Saved to {runs_file}")
 
 
 if __name__ == "__main__":
